@@ -1,0 +1,118 @@
+# PC-CDDM 默认配置
+# 路径段可在 Notebook 中通过代码覆盖
+
+# ============================================================
+# 路径配置
+# ============================================================
+paths:
+  # 数据集路径
+  # 本地: data/dataset.h5
+  # Kaggle: /kaggle/input/pc-cddm-data/dataset.h5
+  data: "data/dataset.h5"
+
+  # 输出根目录（checkpoint / 日志 / tensorboard）
+  # 本地: runs/
+  # Kaggle: /kaggle/working/runs/
+  output_root: "runs/"
+
+  # 实验名（每次新实验改一下）
+  exp_name: "exp_default"
+
+  # 续训用的 checkpoint（None 表示从头训）
+  resume_from: null
+
+# ============================================================
+# 数据配置
+# ============================================================
+data:
+  signal_length: 1024            # IQ 信号长度
+  num_channels: 2                # I/Q 双通道
+  val_ratio: 0.1                 # 验证集比例
+  num_workers: 2                 # DataLoader workers (Kaggle 建议 2)
+  pin_memory: true
+
+# ============================================================
+# 扩散过程配置
+# ============================================================
+diffusion:
+  num_timesteps: 1000            # T
+  beta_schedule: "linear"        # linear | cosine
+  beta_start: 1.0e-4
+  beta_end: 0.02
+  # PSD 损失时间阈值（仅 t < threshold 时施加 L_psd）
+  psd_loss_threshold_ratio: 0.25 # T_threshold = T * 0.25 = 250
+
+# ============================================================
+# PSD 估计配置
+# ============================================================
+psd:
+  nperseg: 256
+  noverlap: 128
+  fs: 1.0                        # 归一化采样率
+  eps: 1.0e-8                    # log 域数值保护
+  # PSD 向量维度 = nperseg // 2 + 1 = 129
+
+# ============================================================
+# 模型结构配置
+# ============================================================
+model:
+  # 时间步与 SNR embedding
+  time_embed_dim: 128            # sinusoidal embedding 展开维度
+  time_mlp_dim: 64               # 经 MLP 后的维度
+  snr_embed_dim: 128
+  snr_mlp_dim: 64
+  snr_encoding: "sinusoidal"     # sinusoidal | linear (留作消融)
+  # PSD 编码（PSD 是 129 维，经 MLP 映射）
+  psd_mlp_hidden: 256
+  psd_mlp_out: 64
+  # 三路融合后的条件向量
+  cond_dim: 256
+  # 1D-UNet 通道
+  base_channels: 64              # 第一层通道数
+  channel_mults: [1, 2, 4]       # 三级降采样倍率 -> 64, 128, 256
+  num_res_blocks: 2              # 每级 ResBlock 数
+  groupnorm_groups: 8
+
+# ============================================================
+# 训练配置
+# ============================================================
+train:
+  batch_size: 32
+  num_epochs: 50
+  lr: 2.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0                 # 梯度裁剪，0 表示不裁
+  grad_accum_steps: 1            # 梯度累积步数（显存吃紧时调大）
+  amp: true                      # 混合精度训练
+  # PSD 损失权重
+  lambda_psd: 0.1
+  # 日志频率
+  log_every: 100                 # 每多少步打一次训练 loss
+  val_every_epochs: 1            # 每多少 epoch 跑一次验证
+  save_every_epochs: 1           # 每多少 epoch 存一次 checkpoint
+  keep_last_n_ckpts: 3           # 只保留最近 N 个 checkpoint
+  # 会话感知退出（Kaggle 9 小时限制，留 1 小时余量）
+  max_wallclock_hours: 8.0
+  # 验证用快速采样（DDIM）
+  val_ddim_steps: 50             # 验证时用 DDIM 快速采样的步数
+
+# ============================================================
+# 推理/评估配置
+# ============================================================
+eval:
+  # 完整反向采样（论文最终结果）
+  full_sampling_steps: 1000      # 等于 num_timesteps，DDPM 完整链
+  # PSD 推理迭代细化间隔
+  psd_refine_interval: 50        # 每 K 步重估一次 PSD
+  # 是否使用 DDIM 加速
+  use_ddim: false                # 评估默认完整采样
+  ddim_steps: 100                # 如开 DDIM, 用多少步
+  # 测试集分块（避免单会话装不下）
+  chunk_size: 500                # 每次评估 500 个样本
+
+# ============================================================
+# 杂项
+# ============================================================
+misc:
+  seed: 42
+  device: "cuda"                 # cuda | cpu

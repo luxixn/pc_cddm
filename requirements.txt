@@ -1,0 +1,11 @@
+# 核心依赖（Kaggle Notebook 已预装，本地需手动安装）
+torch>=2.1.0
+numpy>=1.24
+h5py>=3.9
+pyyaml>=6.0
+tqdm>=4.65
+scipy>=1.11
+tensorboard>=2.15
+
+# 仅本地开发/调试用（可选）
+# scipy 用于 PSD 数值对照测试
