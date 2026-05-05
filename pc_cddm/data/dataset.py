@@ -80,33 +80,59 @@ def parse_snr(snr_str: str) -> float:
 
 def parse_snr_from_filename(filename: str) -> float | None:
     """
-    从完整文件名中提取 SNR。
+    从文件名 (可能是组合格式) 中提取 SNR。
 
-    命名格式: [信号集]_[耦合类型]_[子类型]_[SNR]_[噪声]_[编号].mat
-    SNR 字段固定在下划线分隔后的第 4 段 (index 3)。
+    支持的输入格式:
+        1. 组合格式 (实际数据集使用):
+           "WZ:WZ_DL_LFM_WZ_WZ_00001.mat | HZ:HZ_DL_LFM_n15_GS_00001.mat"
+           -> 提取 HZ 段, 解析 SNR
+        2. 纯 HZ 文件名:
+           "HZ_DL_LFM_n15_GS_00001.mat"
+           -> 直接解析 SNR
+        3. 纯 WZ 无噪样本 (未配对):
+           "WZ_DL_LFM_WZ_WZ_00001.mat"
+           -> 返回 None, 调用方 (IQDataset) 会跳过
+           (实际数据集每一行都是组合格式, 此分支仅作防御)
 
-    特殊处理:
-        WZ (无噪基准样本) 的 SNR 字段也是 "WZ", 此时返回 None。
-        调用方 (IQDataset) 会自动跳过这些样本 — 无噪样本对扩散去噪
-        训练没有意义 (y == x_0, n = 0, L_psd 会出现 log(0) 不稳定)。
+    命名规则 (HZ 部分):
+        [HZ]_[耦合类型]_[子类型]_[SNR]_[噪声]_[编号].mat
+        SNR 字段在第 4 段 (index 3), 例:
+            "n15"  -> -15 dB
+            "n10"  -> -10 dB
+            "n5"   ->  -5 dB
+            "0"    ->   0 dB   (无 p 前缀)
+            "5"    ->   5 dB
+            "10"   ->  10 dB
 
     Args:
-        filename: e.g. "HZ_LD-TX_LFM-QPSK_n10_GS-XW_00001.mat"
+        filename: 完整文件名字符串
 
     Returns:
-        float: SNR dB 值; 若是 WZ 无噪样本则返回 None
+        float: SNR dB 值; None 表示无噪样本
     """
-    # 取文件基名(去路径)
-    basename = os.path.basename(filename)
-    # 去掉 .mat 后缀再分割
+    s = filename.strip()
+
+    # 1. 组合格式 "WZ:... | HZ:..." -> 提取 HZ 段
+    if "HZ:" in s:
+        idx = s.find("HZ:")
+        hz_part = s[idx + 3:]               # 去掉 "HZ:" 前缀
+        if "|" in hz_part:                  # 防御: HZ 后面再有竖线就截断
+            hz_part = hz_part.split("|", 1)[0]
+        s = hz_part.strip()
+    elif s.startswith("WZ:"):
+        # 只剩 WZ 段 (没有配对 HZ): 视作无噪样本
+        return None
+
+    # 2. 走标准字段切分
+    basename = os.path.basename(s)
     parts = basename.replace(".mat", "").split("_")
     if len(parts) < 6:
         raise ValueError(
             f"文件名字段数不足 6 段: '{filename}' -> {parts}"
         )
-    snr_field = parts[3]  # index 3 固定为 SNR 字段
+    snr_field = parts[3]
     if snr_field == "WZ":
-        return None
+        return None                         # 防御: 纯 WZ 文件名也支持
     return parse_snr(snr_field)
 
 
@@ -311,6 +337,11 @@ if __name__ == "__main__":
         ("HZ_LD-TX_LFM-QPSK_n10_GS-XW_00001.mat",       -10.0),
         ("HZ_LD-TX-GR_LFM-16QAM-ZB_n5_GS-FH-MCZ_00001.mat", -5.0),
         ("/some/path/HZ_DL_LFM_p5_GS_00099.mat",           5.0),
+        # 实际数据集的组合格式 (WZ:... | HZ:...)
+        ("WZ:WZ_DL_LFM_WZ_WZ_00001.mat | HZ:HZ_DL_LFM_n15_GS_00001.mat", -15.0),
+        ("WZ:WZ_TX-GR_QPSK-MC_WZ_WZ_29926.mat | HZ:HZ_TX-GR_QPSK-MC_0_GS_29926.mat", 0.0),
+        ("WZ:WZ_LD-TX-GR_LFM-16QAM-MC_WZ_WZ_59850.mat | HZ:HZ_LD-TX-GR_LFM-16QAM-MC_10_GS-FH-MCZ_59850.mat", 10.0),
+        ("WZ:WZ_LD-TX-GR_LFM-QPSK-KD_WZ_WZ_44888.mat | HZ:HZ_LD-TX-GR_LFM-QPSK-KD_5_GS-FH_44888.mat", 5.0),
     ]
     all_ok2 = True
     for fn, expected in fn_cases:
