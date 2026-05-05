@@ -27,7 +27,7 @@ env/
 *.ipynb_meta
 
 # Project-specific: 数据/模型/日志不进 git
-data/
+/data/
 *.h5
 *.hdf5
 *.npy
