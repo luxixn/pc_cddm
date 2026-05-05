@@ -4,6 +4,7 @@ from .schedule import (
     extract,
 )
 from .train_loss import compute_pcddm_loss, LossOutput
+from .sample import sample, _make_ddim_timesteps
 
 __all__ = [
     "DiffusionSchedule",
@@ -11,4 +12,6 @@ __all__ = [
     "extract",
     "compute_pcddm_loss",
     "LossOutput",
+    "sample",
+    "_make_ddim_timesteps",
 ]
