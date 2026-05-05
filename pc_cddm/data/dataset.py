@@ -78,20 +78,25 @@ def parse_snr(snr_str: str) -> float:
     return value
 
 
-def parse_snr_from_filename(filename: str) -> float:
+def parse_snr_from_filename(filename: str) -> float | None:
     """
     从完整文件名中提取 SNR。
 
     命名格式: [信号集]_[耦合类型]_[子类型]_[SNR]_[噪声]_[编号].mat
     SNR 字段固定在下划线分隔后的第 4 段 (index 3)。
 
+    特殊处理:
+        WZ (无噪基准样本) 的 SNR 字段也是 "WZ", 此时返回 None。
+        调用方 (IQDataset) 会自动跳过这些样本 — 无噪样本对扩散去噪
+        训练没有意义 (y == x_0, n = 0, L_psd 会出现 log(0) 不稳定)。
+
     Args:
         filename: e.g. "HZ_LD-TX_LFM-QPSK_n10_GS-XW_00001.mat"
 
     Returns:
-        float: SNR dB 值
+        float: SNR dB 值; 若是 WZ 无噪样本则返回 None
     """
-    # 取文件基名（去路径）
+    # 取文件基名(去路径)
     basename = os.path.basename(filename)
     # 去掉 .mat 后缀再分割
     parts = basename.replace(".mat", "").split("_")
@@ -100,6 +105,8 @@ def parse_snr_from_filename(filename: str) -> float:
             f"文件名字段数不足 6 段: '{filename}' -> {parts}"
         )
     snr_field = parts[3]  # index 3 固定为 SNR 字段
+    if snr_field == "WZ":
+        return None
     return parse_snr(snr_field)
 
 
@@ -139,43 +146,69 @@ class IQDataset(Dataset):
         self.seed = seed
 
         # ------------------------------------------------------------------
-        # 读取 H5 文件, 解析 SNR
+        # 读取 H5 文件, 解析 SNR, 过滤 WZ 无噪样本
         # ------------------------------------------------------------------
         with h5py.File(h5_path, "r") as f:
-            N = f["hz_signals"].shape[0]
+            N_total = f["hz_signals"].shape[0]
 
-            # 解析 filenames -> SNR 数组 (全量, 再按 split 切)
-            raw_filenames = f["filenames"][:]  # (N,) object / bytes
+            # 解析 filenames -> SNR 数组, 同时收集 HZ 样本的真实索引
+            raw_filenames = f["filenames"][:]  # (N_total,) object / bytes
             snr_list: list[float] = []
-            for fn in raw_filenames:
-                # h5py 可能返回 bytes 或 str
+            valid_idx: list[int] = []          # 在 H5 内的真实行号
+            n_wz_skipped = 0
+            for i, fn in enumerate(raw_filenames):
                 fn_str = fn.decode() if isinstance(fn, (bytes, bytearray)) else str(fn)
-                snr_list.append(parse_snr_from_filename(fn_str))
-            snr_all = np.array(snr_list, dtype=np.float32)  # (N,)
+                snr_val = parse_snr_from_filename(fn_str)
+                if snr_val is None:
+                    # WZ 无噪样本: 跳过 (训练去噪模型用不到)
+                    n_wz_skipped += 1
+                    continue
+                snr_list.append(snr_val)
+                valid_idx.append(i)
 
-            # 按 split 切分索引 (按文件顺序, 尾部做 val)
+            if n_wz_skipped > 0:
+                print(
+                    f"[IQDataset] 跳过 {n_wz_skipped} 个 WZ 无噪样本 "
+                    f"(剩余 {len(valid_idx)} / {N_total} 个 HZ 含噪样本)"
+                )
+
+            if len(valid_idx) == 0:
+                raise RuntimeError(
+                    f"H5 中没有任何 HZ 含噪样本 (跳过 {n_wz_skipped} 个 WZ); "
+                    f"请检查数据文件 {h5_path}"
+                )
+
+            valid_idx_arr = np.array(valid_idx, dtype=np.int64)  # H5 行号
+            snr_all = np.array(snr_list, dtype=np.float32)        # 与 valid_idx 对齐
+            N = len(valid_idx)                                    # 有效样本数
+
+            # 按 split 切分 (在过滤后样本上做切分)
             n_val = max(1, int(N * val_ratio))
             if split == "train":
-                indices = np.arange(0, N - n_val)
+                sub = np.arange(0, N - n_val)
             elif split == "val":
-                indices = np.arange(N - n_val, N)
+                sub = np.arange(N - n_val, N)
             else:  # "all"
-                indices = np.arange(N)
+                sub = np.arange(N)
 
-            self.snr_db = torch.from_numpy(snr_all[indices])  # [M]
+            self.snr_db = torch.from_numpy(snr_all[sub])  # [M]
+
+            # sub 索引映射回 H5 真实行号 (用于 hz/wz 读取)
+            real_indices = valid_idx_arr[sub]             # H5 行号, 单调递增
 
             # 按需 preload
             if preload:
-                self.hz = torch.from_numpy(f["hz_signals"][indices])   # [M, 2, 1024]
-                self.wz = torch.from_numpy(f["wz_signals"][indices])   # [M, 2, 1024]
+                # h5py 支持 ndarray 索引 (递增); valid_idx 按 i 顺序构建天然递增
+                self.hz = torch.from_numpy(f["hz_signals"][real_indices])  # [M, 2, L]
+                self.wz = torch.from_numpy(f["wz_signals"][real_indices])  # [M, 2, L]
                 self._preloaded = True
             else:
-                # lazy 模式: 存储索引, __getitem__ 时开文件读
-                self._indices = indices
+                # lazy 模式: 存储 H5 真实行号
+                self._indices = real_indices
                 self._preloaded = False
                 self._h5_path = h5_path
 
-        self._len = len(indices)
+        self._len = len(sub)
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -300,11 +333,9 @@ if __name__ == "__main__":
     except ValueError as e:
         print(f"✓ parse_snr('WZ') 正确报错: {e}")
 
-    try:
-        parse_snr_from_filename("WZ_DL_LFM_WZ_WZ_00001.mat")
-        print("✗ 应抛出 ValueError 未抛出")
-    except ValueError as e:
-        print(f"✓ WZ 文件名正确报错: {e}")
+    # WZ 文件名: 现在返回 None (而不是报错), 由 IQDataset 跳过
+    wz_result = parse_snr_from_filename("WZ_DL_LFM_WZ_WZ_00001.mat")
+    print(f"✓ WZ 文件名返回 None (无噪样本): {wz_result is None}")
 
     # ==================================================================
     print("\n" + "=" * 60)
@@ -412,6 +443,50 @@ if __name__ == "__main__":
 
     # 清理临时文件
     os.unlink(tmp_path)
+
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("测试 7: 混合 WZ + HZ 数据集, 验证 WZ 自动过滤")
+    print("=" * 60)
+    # ==================================================================
+    # 构造: 50 HZ + 30 WZ 共 80 个样本
+    N_hz, N_wz = 50, 30
+    N_mix = N_hz + N_wz
+    mock_filenames_mix = []
+    # 先 HZ 后 WZ (检查跳过逻辑不依赖位置)
+    for i in range(N_hz):
+        snr_v = snr_vals[i % len(snr_vals)]
+        mock_filenames_mix.append(
+            f"HZ_DL_LFM_{_snr_to_str(snr_v)}_GS_{i+1:05d}.mat".encode()
+        )
+    for i in range(N_wz):
+        mock_filenames_mix.append(
+            f"WZ_DL_LFM_WZ_WZ_{i+1:05d}.mat".encode()
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+        tmp_path_mix = tmp.name
+    with h5py.File(tmp_path_mix, "w") as f:
+        f.create_dataset("filenames",  data=np.array(mock_filenames_mix, dtype=object),
+                         dtype=h5py.special_dtype(vlen=str))
+        f.create_dataset("hz_signals", data=np.random.randn(N_mix, 2, 1024).astype(np.float32))
+        f.create_dataset("wz_signals", data=np.random.randn(N_mix, 2, 1024).astype(np.float32))
+
+    print("(下面这一行 [IQDataset] 输出是预期的:)")
+    ds_mix = IQDataset(tmp_path_mix, split="all", val_ratio=0.1,
+                       snr_perturb_db=0.0, preload=True)
+    print(f"\n过滤后样本数: {len(ds_mix)}  (期望 {N_hz}, 即只保留 HZ)")
+    print(f"WZ 全部跳过 ✓: {len(ds_mix) == N_hz}")
+
+    # 验证保留的 SNR 全部在合理范围
+    in_range = (ds_mix.snr_db >= -15.0) & (ds_mix.snr_db <= 10.0)
+    print(f"剩余 SNR 全在 [-15, 10] 内 ✓: {in_range.all().item()}")
+
+    # __getitem__ 不应再触发任何 ValueError
+    y, x0, snr = ds_mix[0]
+    print(f"__getitem__[0] 正常返回 ✓: shape={tuple(y.shape)}, snr={snr.item():.1f}")
+
+    os.unlink(tmp_path_mix)
 
     print("\n" + "=" * 60)
     print("全部自检完成")
