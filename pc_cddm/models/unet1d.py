@@ -2,13 +2,19 @@
 1D-UNet for IQ signal denoising in PC-CDDM.
 
 架构概览:
-    输入 x_t [B, 2, 1024] + 条件 c [B, cond_dim]
-        -> 入口 Conv (2 -> base_channels)
+    输入 x_t [B, 2, 1024] + 含噪观测 y [B, 2, 1024] + 条件 c [B, cond_dim]
+        -> 入口 Conv (4 -> base_channels): [x_t || y] concat 后送入
         -> Down 路径 (3 stages, 每 stage 2 ResBlock + 1 Downsample)
         -> Mid (2 ResBlock)
         -> Up 路径 (3 stages, 每 stage 2 ResBlock + 1 Upsample, 含 skip concat)
         -> 出口 GN + SiLU + Conv (base_channels -> 2)
     输出 ε̂ [B, 2, 1024]
+
+关键改动 (vs. 初版):
+    将含噪观测 y 作为额外输入通道与 x_t concat 后送入入口 Conv。
+    初版仅靠 FiLM 条件 (SNR + PSD) 注入观测信息, 模型无法看到具体 y, 退化为
+    "条件生成器" 而非去噪器: 各 SNR 档位输出 SNR 锁死同一值, NMSE > 1。
+    现修复后模型每步反向去噪都能直接访问 y, 真正实现观测条件去噪。
 
 ResBlock 采用 pre-activation 风格 (He et al., 2016 "Identity Mappings"):
     GN -> FiLM₁ -> SiLU -> Conv -> GN -> FiLM₂ -> SiLU -> [Dropout] -> Conv -> +skip
@@ -19,7 +25,7 @@ Skip 连接:
     Down 路径每个 ResBlock 输出 push 到栈, Up 路径每个 ResBlock 前 pop 并 concat。
     总 skip 数 = down_stages * resblocks_per_stage = 3 * 2 = 6。
 
-参数量目标: ~10M
+参数量目标: ~10M (新增 entry conv 输入通道翻倍带来约 +128 参数, 可忽略)
 """
 
 from __future__ import annotations
@@ -158,12 +164,12 @@ class Upsample1D(nn.Module):
 # ============================================================================
 class UNet1D(nn.Module):
     """
-    1D-UNet 主体, 接收 x_t 和条件 c 预测噪声 ε̂。
+    1D-UNet 主体, 接收 x_t、含噪观测 y 和条件 c, 预测噪声 ε̂。
 
     架构 (默认参数):
         in_ch=2, base=64, mults=[1,2,4], num_res=2, gn_groups=8
 
-        Entry:  Conv(2 -> 64)
+        Entry:  Conv(4 -> 64)  ← [x_t (2ch) || y (2ch)] concat 后送入
         Down 0: ResBlock(64->64), ResBlock(64->64), Downsample(64)        L: 1024->512
         Down 1: ResBlock(64->128), ResBlock(128->128), Downsample(128)    L: 512->256
         Down 2: ResBlock(128->256), ResBlock(256->256)  (无 downsample)
@@ -174,7 +180,7 @@ class UNet1D(nn.Module):
         Exit:   GN(64) -> SiLU -> Conv(64 -> 2)
 
     Args:
-        in_channels:    输入通道数 (= 2, IQ 双通道)
+        in_channels:    单路输入通道数 (= 2, IQ 双通道; 实际 entry 输入 2*in_channels=4)
         base_channels:  基础通道数 (= 64)
         channel_mults:  各级通道倍率 (= [1, 2, 4])
         num_res_blocks: 每级 ResBlock 数 (= 2)
@@ -204,7 +210,8 @@ class UNet1D(nn.Module):
         stage_channels = [base_channels * m for m in channel_mults]
 
         # ----- Entry -----
-        self.entry = nn.Conv1d(in_channels, base_channels, kernel_size=3, padding=1)
+        # 输入是 [x_t || y] 在 channel 维 concat, 通道数 = 2 * in_channels
+        self.entry = nn.Conv1d(in_channels * 2, base_channels, kernel_size=3, padding=1)
 
         # ----- Down 路径 -----
         # 注意: 第一个 stage 输入是 base_channels (来自 entry), 不是 stage_channels[0]
@@ -277,11 +284,17 @@ class UNet1D(nn.Module):
         nn.init.zeros_(self.exit_conv.weight)
         nn.init.zeros_(self.exit_conv.bias)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            x: [B, in_channels, L] noisy IQ signal x_t
-            c: [B, cond_dim]       condition vector
+            x: [B, in_channels, L] noisy IQ signal x_t (扩散链中间态)
+            c: [B, cond_dim]       condition vector (SNR + PSD + t)
+            y: [B, in_channels, L] 含噪观测 IQ 信号 (反向链中保持不变)
 
         Returns:
             [B, in_channels, L]    predicted noise ε̂
@@ -290,13 +303,18 @@ class UNet1D(nn.Module):
             raise ValueError(
                 f"期望 x shape [B, {self.in_channels}, L]，实际 {tuple(x.shape)}"
             )
+        if y.shape != x.shape:
+            raise ValueError(
+                f"y 必须与 x 同 shape, 期望 {tuple(x.shape)}, 实际 {tuple(y.shape)}"
+            )
         if c.dim() != 2 or c.size(1) != self.cond_dim:
             raise ValueError(
                 f"期望 c shape [B, {self.cond_dim}]，实际 {tuple(c.shape)}"
             )
 
-        # ----- Entry -----
-        h = self.entry(x)  # [B, base_channels, L]
+        # ----- Entry: 拼接 x_t 与 y 后送入 -----
+        h_in = torch.cat([x, y], dim=1)  # [B, 2*in_channels, L]
+        h = self.entry(h_in)              # [B, base_channels, L]
 
         # ----- Down -----
         skips: list[torch.Tensor] = []
@@ -336,7 +354,7 @@ class UNet1D(nn.Module):
             model_cfg: yaml['model'] 段
         """
         return cls(
-            in_channels=2,  # 固定 IQ 双通道
+            in_channels=2,  # 固定 IQ 双通道 (entry conv 内部会乘 2 接收 x_t||y)
             base_channels=model_cfg["base_channels"],
             channel_mults=tuple(model_cfg["channel_mults"]),
             num_res_blocks=model_cfg["num_res_blocks"],
@@ -366,7 +384,7 @@ if __name__ == "__main__":
         dropout=0.0,
     )
     n_params = sum(p.numel() for p in net.parameters())
-    print(f"总参数量: {n_params:,}  (目标 ~10M)")
+    print(f"总参数量: {n_params:,}  (相比初版 6,571,458 多约 +128 个 entry conv 参数)")
 
     # 各模块参数量分解
     def count_params(module):
@@ -384,9 +402,11 @@ if __name__ == "__main__":
     B, L = 4, 1024
     x = torch.randn(B, 2, L)
     c = torch.randn(B, 256)
+    y = torch.randn(B, 2, L)
 
-    out = net(x, c)
+    out = net(x, c, y)
     print(f"\n输入 x shape: {tuple(x.shape)}")
+    print(f"输入 y shape: {tuple(y.shape)}")
     print(f"输入 c shape: {tuple(c.shape)}")
     print(f"输出 shape  : {tuple(out.shape)}  (期望 [{B}, 2, {L}])")
     print(f"输出 stats  : mean={out.mean():.6f}, std={out.std():.6f}")
@@ -397,14 +417,14 @@ if __name__ == "__main__":
     # ===== 训练后输出非零 =====
     with torch.no_grad():
         net.exit_conv.weight.normal_(0, 0.01)
-    out2 = net(x, c)
+    out2 = net(x, c, y)
     print(f"\n模拟训练后输出 std: {out2.std():.6f} (应 > 0)")
     print(f"  非零检查: {'✓' if out2.std() > 1e-4 else '✗'}")
 
     # ===== 反向传播 =====
     print(f"\n反向传播测试:")
     net.zero_grad()
-    out3 = net(x, c)
+    out3 = net(x, c, y)
     loss = out3.pow(2).mean()
     loss.backward()
     no_grad = [n for n, p in net.named_parameters() if p.grad is None]
@@ -427,21 +447,31 @@ if __name__ == "__main__":
     net.zero_grad()
     x1 = torch.randn(B, 2, L)
     x2 = torch.randn(B, 2, L)
+    y_same = torch.randn(B, 2, L)
     c_same = torch.randn(B, 256)
-    out_x1 = net(x1, c_same)
-    out_x2 = net(x2, c_same)
+    out_x1 = net(x1, c_same, y_same)
+    out_x2 = net(x2, c_same, y_same)
     diff_x = (out_x1 - out_x2).abs().mean().item()
-    print(f"\n[模拟训练后] 输入敏感性: 不同 x 同 c, mean|Δout| = {diff_x:.4f}")
+    print(f"\n[模拟训练后] x 敏感性: 不同 x 同 c 同 y, mean|Δout| = {diff_x:.4f}")
     print(f"  期望 > 0: {'✓' if diff_x > 1e-4 else '✗'}")
 
-    # 不同条件产生不同输出
+    # 不同观测 y 产生不同输出 (新增检查, 验证 y 真正进入网络)
     x_same = torch.randn(B, 2, L)
+    y1 = torch.randn(B, 2, L)
+    y2 = torch.randn(B, 2, L)
+    out_y1 = net(x_same, c_same, y1)
+    out_y2 = net(x_same, c_same, y2)
+    diff_y = (out_y1 - out_y2).abs().mean().item()
+    print(f"[模拟训练后] y 敏感性: 同 x 同 c 不同 y, mean|Δout| = {diff_y:.4f}")
+    print(f"  期望 > 0 (y 必须真正影响输出): {'✓' if diff_y > 1e-4 else '✗'}")
+
+    # 不同条件产生不同输出
     c1 = torch.randn(B, 256)
     c2 = torch.randn(B, 256)
-    out_c1 = net(x_same, c1)
-    out_c2 = net(x_same, c2)
+    out_c1 = net(x_same, c1, y_same)
+    out_c2 = net(x_same, c2, y_same)
     diff_c = (out_c1 - out_c2).abs().mean().item()
-    print(f"[模拟训练后] 条件敏感性: 同 x 不同 c, mean|Δout| = {diff_c:.4f}")
+    print(f"[模拟训练后] c 敏感性: 同 x 同 y 不同 c, mean|Δout| = {diff_c:.4f}")
     print(f"  期望 > 0: {'✓' if diff_c > 1e-4 else '✗'}")
     print(f"  注: 初始 zero-init 时条件无影响是设计预期, 训练后 FiLM 学到非零调制即可")
 
@@ -450,8 +480,11 @@ if __name__ == "__main__":
     net.eval()
     x_trace = torch.randn(2, 2, 1024)
     c_trace = torch.randn(2, 256)
+    y_trace = torch.randn(2, 2, 1024)
     with torch.no_grad():
-        h = net.entry(x_trace)
+        h_in = torch.cat([x_trace, y_trace], dim=1)
+        print(f"  entry input (cat): {tuple(h_in.shape)}")
+        h = net.entry(h_in)
         print(f"  entry out      : {tuple(h.shape)}")
         for i, (stage, down) in enumerate(zip(net.down_blocks, net.down_samples)):
             for j, rb in enumerate(stage):
@@ -495,5 +528,6 @@ if __name__ == "__main__":
         ).cuda()
         x_gpu = torch.randn(B, 2, L).cuda()
         c_gpu = torch.randn(B, 256).cuda()
-        out_gpu = net_gpu(x_gpu, c_gpu)
+        y_gpu = torch.randn(B, 2, L).cuda()
+        out_gpu = net_gpu(x_gpu, c_gpu, y_gpu)
         print(f"\n[GPU] 输出 device: {out_gpu.device}, shape: {tuple(out_gpu.shape)}")

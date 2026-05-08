@@ -9,10 +9,11 @@ PC-CDDM 反向采样推理链路。
     - 每 psd_refine_interval 步用当前 x̂_0 反推 n̂ = y - x̂_0, 重估 psd_hat
       (低 t 时 x̂_0 越来越可信, 重估越来越有意义)
     - 初始 psd_hat 从 y 直接估计 (低 SNR 时 y 谱 ≈ n 谱)
+    - y 作为额外输入通道送入 UNet (与 x_t concat), 反向链每一步保持不变
 
 推理核心公式:
     DDPM 单步:
-        ε̂ = UNet(x_t, c)
+        ε̂ = UNet(x_t, c, y)         ← y 拼到输入通道
         x̂_0 = predict_x0_from_eps(x_t, t, ε̂)
         μ   = q_posterior_mean(x̂_0, x_t, t)
         x_{t-1} = μ + σ_t · z   (t > 0),  z ~ N(0, I)
@@ -20,7 +21,7 @@ PC-CDDM 反向采样推理链路。
         σ_t = √posterior_variance[t]
 
     DDIM 单步 (η=0, 确定性):
-        ε̂ = UNet(x_τ, c)
+        ε̂ = UNet(x_τ, c, y)
         x̂_0 = predict_x0_from_eps(x_τ, τ, ε̂)
         x_{τ_prev} = √ᾱ_{τ_prev} · x̂_0 + √(1 - ᾱ_{τ_prev}) · ε̂
 
@@ -163,7 +164,7 @@ def sample(
         unet:              训练好的 UNet1D 模型
         condition_encoder: ConditionEncoder 模型
         schedule:          DiffusionSchedule (含所有预计算 buffer)
-        y:                 [B, 2, L] 含噪 IQ 观测信号
+        y:                 [B, 2, L] 含噪 IQ 观测信号 (反向链中保持不变, 作为 UNet 额外输入)
         snr_db:            [B] 物理 SNR 标量 (dB, 与训练一致)
         method:            "ddpm" 随机全链路 | "ddim" 确定性加速
         num_inference_steps: DDIM 步数; DDPM 时默认 schedule.T
@@ -259,8 +260,8 @@ def sample(
         t_batch = torch.full((B,), tau, dtype=torch.long, device=device)       # [B]
         c = condition_encoder(t_batch, snr_db, psd_hat)  # [B, 256]
 
-        # ---- UNet 预测 ε̂ ----
-        eps_pred = unet(x_t, c)  # [B, 2, 1024]
+        # ---- UNet 预测 ε̂ (y 作为额外输入通道, 反向链中保持不变) ----
+        eps_pred = unet(x_t, c, y)  # [B, 2, 1024]
 
         # ---- 反向单步 ----
         if method == "ddpm":

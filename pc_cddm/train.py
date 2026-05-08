@@ -127,7 +127,7 @@ def train_step(
         3. 采 t ~ U[0, T-1], eps ~ N(0, I)
         4. x_t = q_sample(x_0, t, eps)
         5. c = condition_encoder(t, snr, psd_gt_log)
-        6. eps_pred = unet(x_t, c)
+        6. eps_pred = unet(x_t, c, y)         ← y 作为额外输入通道
         7. loss = compute_pcddm_loss(...)
 
     Args:
@@ -166,8 +166,8 @@ def train_step(
     # 4) 条件编码
     c = condition_encoder(t, snr_db, psd_gt_log)   # [B, cond_dim]
 
-    # 5) 网络前向
-    eps_pred = unet(x_t, c)                        # [B, 2, L]
+    # 5) 网络前向 (y 作为额外输入通道, 让 UNet 直接看到含噪观测)
+    eps_pred = unet(x_t, c, y)                     # [B, 2, L]
 
     # 6) 损失 (PSD threshold = T * ratio)
     psd_threshold = int(T * cfg["diffusion"]["psd_loss_threshold_ratio"])
